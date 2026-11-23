@@ -1,0 +1,12 @@
+WeMM-Video support is ported from Tencent/WeMM-Video:
+  source commit: 6cefad232b94e3e190d747251f35799b8b142213
+  overlay: patch/vllm/0.31.0
+
+The WeMM model/media modules and model-specific chat parser additions extend
+vLLM under Apache-2.0. Original source notices are retained.
+Local modifications adapt the multimodal processor hooks to this checkout
+and preserve non-WeMM media dispatch. The ordinary vLLM LICENSE applies.
+
+wemm_bert.py is adapted from Salesforce LAVIS:
+  Copyright (c) 2023, salesforce.com, inc. All rights reserved.
+  BSD-3-Clause; the complete notice is in LICENSE.wemm-lavis.

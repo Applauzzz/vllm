@@ -1384,6 +1384,14 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "Qwen/Qwen3.5-35B-A3B",
         max_model_len=4096,
     ),
+    "WeMMVideoForConditionalGeneration": _HfExamplesInfo(
+        "tencent/WeMM-Video-2B", max_model_len=4096,
+        min_transformers_version="5.2.0",
+    ),
+    "WeMMVideoMoeForConditionalGeneration": _HfExamplesInfo(
+        "tencent/WeMM-Video-35BA3B", max_model_len=4096,
+        min_transformers_version="5.2.0",
+    ),
     "Qwen4ExpForConditionalGeneration": _HfExamplesInfo(
         "",
         is_available_online=False,

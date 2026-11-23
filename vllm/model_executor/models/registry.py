@@ -594,6 +594,14 @@ _MULTIMODAL_MODELS = {
         "qwen3_vl_moe",
         "Qwen3VLMoeForConditionalGeneration",
     ),
+    "WeMMVideoForConditionalGeneration": (
+        "wemm_omni",
+        "WeMMVideoForConditionalGeneration",
+    ),
+    "WeMMVideoMoeForConditionalGeneration": (
+        "wemm_omni",
+        "WeMMVideoMoeForConditionalGeneration",
+    ),
     "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "Qwen3_5MoeForConditionalGeneration": (
         "qwen3_5",
@@ -1294,6 +1302,11 @@ class _ModelRegistry:
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
+        # Dense and MoE checkpoints share the public WeMM architecture name.
+        if architecture == "WeMMVideoForConditionalGeneration":
+            text_config = getattr(model_config.hf_config, "text_config", None)
+            if getattr(text_config, "model_type", None) == "qwen3_5_moe_text":
+                return "WeMMVideoMoeForConditionalGeneration"
         if architecture in self.models:
             return architecture
 

@@ -86,6 +86,83 @@ else:
 logger = init_logger(__name__)
 
 
+# ============================================================================
+# WeMM integration: Part-type handler registry
+# ----------------------------------------------------------------------------
+# Allows custom part types (e.g. "video_audio_url", "frames_wav_url") to
+# register their own preprocessing in `_parse_chat_message_content_part`
+# without modifying the main dispatch table. A handler receives the raw
+# `part` dict (so it can read non-standard fields like `fps`, `nframes`,
+# `resized_height`, paired `audio_url`, etc.), the active `mm_parser`, and
+# the optional `uuid`. It returns the modality string (e.g. "video"/"audio")
+# used by the caller to emit the correct placeholder.
+#
+# This replaces the v018-pre hacks that encoded `audio_url` into the
+# video URL string with a "|||WEMM_AUDIO|||" separator. With this registry,
+# video and audio always travel through their own native fetch paths and
+# nothing is rewritten in-memory.
+# ============================================================================
+
+WEMM_PART_HANDLERS: dict[
+    str,
+    Callable[
+        ["ChatCompletionContentPartParam", "BaseMultiModalContentParser", str | None],
+        str | None,
+    ],
+] = {}
+
+
+def register_wemm_part(type_name: str):
+    """Decorator: register a handler for a custom part type."""
+
+    def _deco(fn):
+        WEMM_PART_HANDLERS[type_name] = fn
+        return fn
+
+    return _deco
+
+
+def _wemm_fetch_input_enabled(mm_parser) -> bool:
+    return getattr(mm_parser, "_wemm_enabled", False)
+
+
+# Fields recognised inside `video_url` for WeMM models.
+# These flow through to `MediaConnector.fetch_wemm_video_async(**kwargs)`.
+_WEMM_VIDEO_PARAM_KEYS = (
+    "resized_height",
+    "resized_width",
+    "min_pixels",
+    "max_pixels",
+    "total_pixels",
+    "fps",
+    "nframes",
+    "num_frames",
+    "max_frames",
+    "min_frames",
+)
+
+
+def _wemm_collect_kwargs(d: Any, keys: Iterable[str]) -> dict[str, Any]:
+    """Extract non-None values for `keys` from `d` (a dict-like)."""
+    if not isinstance(d, dict):
+        return {}
+    return {k: d[k] for k in keys if d.get(k) is not None}
+
+
+def _wemm_extract_url(d: Any) -> str | None:
+    """Accept either a plain URL string or `{"url": "..."}`."""
+    if isinstance(d, dict):
+        return d.get("url")
+    if isinstance(d, str):
+        return d
+    return None
+
+
+# ============================================================================
+# End of WeMM integration (registry section)
+# ============================================================================
+
+
 class ChatTemplateResolutionError(ValueError):
     """Raised when chat template resolution fails.
 
@@ -1037,15 +1114,23 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         super().__init__()
 
         self._tracker = tracker
+        from vllm.multimodal.media.wemm import is_wemm_model
+
+        self._wemm_enabled = is_wemm_model(tracker.model_config)
         self._mm_processor_kwargs = mm_processor_kwargs
 
     @cached_property
     def _connector(self) -> MediaConnector:
         # Connector setup may probe VLLM_MEDIA_CACHE. Defer it until a request
         # actually contains media so text-only parsing never blocks on that I/O.
+        from vllm.multimodal.media.wemm import wemm_media_kwargs
+
+        media_kwargs = self._tracker.media_io_kwargs
+        if self._wemm_enabled:
+            media_kwargs = wemm_media_kwargs(self.model_config, media_kwargs)
         return MEDIA_CONNECTOR_REGISTRY.load(
-            envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=self._tracker.media_io_kwargs,
+            "wemm" if self._wemm_enabled else envs.VLLM_MEDIA_CONNECTOR,
+            media_io_kwargs=media_kwargs,
             allowed_local_media_path=self._tracker.allowed_local_media_path,
             allowed_media_domains=self._tracker.allowed_media_domains,
         )
@@ -1143,6 +1228,14 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         placeholder = self._tracker.add("audio", (audio, uuid))
         self._add_placeholder("audio", placeholder)
 
+    def parse_wemm_audio(self, audio_url, uuid=None, timestamp_interval_sec=None):
+        from vllm.multimodal.media.wemm import wemm_audio_item
+
+        audio = self._connector.fetch_audio(audio_url) if audio_url else None
+        item = wemm_audio_item(audio, uuid, timestamp_interval_sec)
+        placeholder = self._tracker.add("audio", item)
+        self._add_placeholder("audio", placeholder)
+
     def parse_input_audio(
         self, input_audio: InputAudio | None, uuid: str | None = None
     ) -> None:
@@ -1182,6 +1275,35 @@ class MultiModalContentParser(BaseMultiModalContentParser):
             audio_placeholder = self._tracker.add("audio", (audio, uuid))
             self._add_placeholder("audio", audio_placeholder)
 
+    # ------------------------------------------------------------------
+    # WeMM integration: per-request kwargs (fps/nframes/resized_*/...)
+    # ------------------------------------------------------------------
+    # The sync path is only used by offline `LLM.generate(...)`. v018 ships
+    # WeMM-specific options only on the async connector
+    # (`fetch_wemm_video_async`), so the sync parser falls back to the
+    # standard `fetch_video` and ignores the extra kwargs. In production
+    # (HTTP server) the async parser below is used. The `audio_url` keyword
+    # is accepted for signature compatibility with the async parser; in
+    # the sync path it is dropped with a warning.
+    def parse_wemm_video(
+        self,
+        video_url: str | None,
+        uuid: str | None = None,
+        *,
+        audio_url: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        video = (
+            self._connector.fetch_wemm_video(video_url, audio_url=audio_url, **kwargs)
+            if video_url
+            else None
+        )
+        from vllm.multimodal.media.wemm import wemm_video_uuid
+
+        uuid = wemm_video_uuid(uuid, video, kwargs)
+        placeholder = self._tracker.add("video", (video, uuid))
+        self._add_placeholder("video", placeholder)
+
     def parse_video_embeds(
         self,
         video_embeds: MultiModalEmbedsPayload | None,
@@ -1218,15 +1340,23 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         super().__init__()
 
         self._tracker = tracker
+        from vllm.multimodal.media.wemm import is_wemm_model
+
+        self._wemm_enabled = is_wemm_model(tracker.model_config)
         self._mm_processor_kwargs: dict[str, Any] | None = mm_processor_kwargs
 
     @cached_property
     def _connector(self) -> MediaConnector:
         # Connector setup may probe VLLM_MEDIA_CACHE. Defer it until a request
         # actually contains media so text-only parsing never blocks on that I/O.
+        from vllm.multimodal.media.wemm import wemm_media_kwargs
+
+        media_kwargs = self._tracker.media_io_kwargs
+        if self._wemm_enabled:
+            media_kwargs = wemm_media_kwargs(self.model_config, media_kwargs)
         return MEDIA_CONNECTOR_REGISTRY.load(
-            envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=self._tracker.media_io_kwargs,
+            "wemm" if self._wemm_enabled else envs.VLLM_MEDIA_CONNECTOR,
+            media_io_kwargs=media_kwargs,
             allowed_local_media_path=self._tracker.allowed_local_media_path,
             allowed_media_domains=self._tracker.allowed_media_domains,
         )
@@ -1364,6 +1494,20 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         )
         self._add_placeholder("audio", placeholder)
 
+    async def _wemm_audio_with_uuid_async(self, audio_url, uuid, interval):
+        from vllm.multimodal.media.wemm import wemm_audio_item
+
+        audio = await self._connector.fetch_audio_async(audio_url) if audio_url else None
+        return wemm_audio_item(audio, uuid, interval)
+
+    def parse_wemm_audio(self, audio_url, uuid=None, timestamp_interval_sec=None):
+        from vllm.multimodal.wemm_timestamps import resolve_timestamp_interval
+
+        interval = resolve_timestamp_interval(timestamp_interval_sec)
+        coro = partial(self._wemm_audio_with_uuid_async, audio_url, uuid, interval)
+        placeholder = self._tracker.add("audio", coro)
+        self._add_placeholder("audio", placeholder)
+
     def parse_input_audio(
         self, input_audio: InputAudio | None, uuid: str | None = None
     ) -> None:
@@ -1407,6 +1551,62 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
                 "audio", partial(self._audio_with_uuid_async, video_url, uuid)
             )
             self._add_placeholder("audio", audio_placeholder)
+
+    # ------------------------------------------------------------------
+    # WeMM integration: forward per-request kwargs (fps/nframes/
+    # resized_*/min_pixels/max_pixels/total_pixels/...) to the WeMM
+    # connector. When the same part also carries an `audio_url`, the
+    # video and audio bytes are concurrently fetched by the connector
+    # and the audio bytes are stashed into the returned video metadata
+    # (`audio_bytes` key). The downstream wemm_omni.py picks the audio
+    # bytes out of the metadata and runs the Whisper feature extractor.
+    # This preserves the training-time token layout (audio_pad is
+    # interleaved inside the <|vision_start|>...<|vision_end|> block)
+    # without doing any in-memory ZIP re-pack.
+    # ------------------------------------------------------------------
+    async def _wemm_video_with_uuid_async(
+        self,
+        video_url: str | None,
+        uuid: str | None,
+        *,
+        audio_url: str | None = None,
+        **kwargs: Any,
+    ):
+        if (
+            video_url
+            and audio_url
+            and hasattr(self._connector, "fetch_wemm_video_with_audio_url_async")
+        ):
+            video = await self._connector.fetch_wemm_video_with_audio_url_async(
+                video_url=video_url, audio_url=audio_url, **kwargs
+            )
+        elif video_url and hasattr(self._connector, "fetch_wemm_video_async"):
+            video = await self._connector.fetch_wemm_video_async(
+                video_url=video_url, **kwargs
+            )
+        elif video_url:
+            video = await self._connector.fetch_video_async(video_url)
+        else:
+            video = None
+        from vllm.multimodal.media.wemm import wemm_video_uuid
+
+        uuid = wemm_video_uuid(uuid, video, kwargs)
+        return video, uuid
+
+    def parse_wemm_video(
+        self,
+        video_url: str | None,
+        uuid: str | None = None,
+        *,
+        audio_url: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        coro = partial(
+            self._wemm_video_with_uuid_async, video_url, uuid,
+            audio_url=audio_url, **kwargs
+        )
+        placeholder = self._tracker.add("video", coro)
+        self._add_placeholder("video", placeholder)
 
     def parse_video_embeds(
         self,
@@ -1659,6 +1859,13 @@ MM_PARSER_MAP: dict[
     "input_audio": lambda part: _InputAudioParser(part).get("input_audio", None),
     "refusal": lambda part: _RefusalParser(part).get("refusal", None),
     "video_url": lambda part: _VideoParser(part).get("video_url", {}).get("url", None),
+    # WeMM integration: `video_audio_url` is a custom WeMM part type that
+    # carries both a video_url and an audio_url in the same part. We do
+    # not extract a single URL here — instead the registered handler in
+    # WEMM_PART_HANDLERS reads both fields from the raw part dict. The
+    # value is set to the part itself so downstream code can keep a
+    # consistent "(part_type, content)" shape.
+    "video_audio_url": lambda part: part,
     "tool_reference": lambda part: cast(
         CustomChatCompletionContentToolReferenceParam, part
     ).get("name", None),
@@ -1706,6 +1913,13 @@ def _parse_chat_message_content_mm_part(
     )  # This is needed to avoid mypy errors: part.get() from str
     part_type = part.get("type", None)
     uuid = part.get("uuid", None)
+
+    # Explicit WeMM extensions must reach their handler with both URLs intact.
+    # The generic UUID inference below otherwise picks audio_url first.
+    if isinstance(part_type, str) and part_type in WEMM_PART_HANDLERS:
+        return part_type, part
+    if part_type == "video_url" and part.get("audio_url") is not None:
+        return part_type, _wemm_extract_url(part.get("video_url"))
 
     if isinstance(part_type, str) and part_type in MM_PARSER_MAP and uuid is None:  # noqa: E501
         content = MM_PARSER_MAP[part_type](part)
@@ -1821,6 +2035,8 @@ def _parse_chat_message_content_parts(
     content = list[_ContentPart]()
 
     mm_parser = mm_tracker.create_parser(mm_processor_kwargs=mm_processor_kwargs)
+    wemm_structured = wrap_dicts and _wemm_fetch_input_enabled(mm_parser)
+    previous_media = False
 
     for part in parts:
         parse_res = _parse_chat_message_content_part(
@@ -1830,6 +2046,22 @@ def _parse_chat_message_content_parts(
             interleave_strings=interleave_strings,
         )
         if parse_res:
+            if wemm_structured:
+                # vLLM 0.31 detects WeMM's structured template. Unlike the
+                # string renderer, that template concatenates parts without
+                # separators. Keep the native media boundaries used by HF
+                # and the earlier string path, including adjacent media.
+                media = not isinstance(part, str) and _parse_chat_message_content_mm_part(part)[0] in {
+                    "image_url", "input_image", "image_pil", "image_embeds",
+                    "video_url", "video_audio_url", "video_embeds",
+                    "audio_url", "input_audio", "audio_embeds",
+                }
+                if content and (previous_media or media):
+                    before = cast(dict[str, Any], content[-1]).get("text", "")
+                    after = cast(dict[str, Any], parse_res).get("text", "")
+                    if not before.endswith("\n") and not after.startswith("\n"):
+                        content.append({"type": "text", "text": "\n"})
+                previous_media = media
             content.append(parse_res)
 
     if wrap_dicts:
@@ -1918,6 +2150,21 @@ def _parse_chat_message_content_part(
         uuid = str(uuid)
 
     modality = None
+    # WeMM integration (Edit D): consult the part-type handler registry
+    # before the built-in dispatch so custom WeMM types (e.g.
+    # "video_audio_url") can override how a part is fetched without
+    # touching this function. Handlers receive the raw part dict and the
+    # active mm_parser; they return the modality string.
+    if isinstance(part_type, str) and part_type in WEMM_PART_HANDLERS:
+        if not _wemm_fetch_input_enabled(mm_parser):
+            raise ValueError(f"{part_type} is only supported by WeMM models")
+        modality = WEMM_PART_HANDLERS[part_type](part, mm_parser, uuid)
+        if modality is None:
+            return None
+        if wrap_dicts:
+            return {"type": modality}
+        return MODALITY_PLACEHOLDERS_MAP[modality] if interleave_strings else None
+
     if part_type == "image_pil":
         image_content = cast(Image.Image, content) if content is not None else None
         mm_parser.parse_image_pil(image_content, uuid)
@@ -1953,15 +2200,79 @@ def _parse_chat_message_content_part(
         modality = "prompt_embeds"
     elif part_type == "audio_url":
         str_content = cast(str, content)
-        mm_parser.parse_audio(str_content, uuid)
+        if getattr(mm_parser, "_wemm_enabled", False):
+            from vllm.multimodal.wemm_timestamps import timestamp_interval_option
+
+            payload = part.get("audio_url", {})
+            nested = payload if isinstance(payload, dict) else {}
+            interval = timestamp_interval_option(part, timestamp_interval_option(nested))
+            mm_parser.parse_wemm_audio(str_content, uuid, interval)
+        else:
+            mm_parser.parse_audio(str_content, uuid)
         modality = "audio"
     elif part_type == "input_audio":
         dict_content = cast(InputAudio, content)
-        mm_parser.parse_input_audio(dict_content, uuid)
+        if _wemm_fetch_input_enabled(mm_parser):
+            if dict_content is None:
+                mm_parser.parse_wemm_audio(None, uuid)
+            else:
+                audio_format = dict_content["format"]
+                audio_url = f"data:audio/{audio_format};base64,{dict_content['data']}"
+                mm_parser.parse_wemm_audio(audio_url, uuid)
+        else:
+            mm_parser.parse_input_audio(dict_content, uuid)
         modality = "audio"
     elif part_type == "video_url":
+        # WeMM integration (Edit E): handle three concerns natively, replacing
+        # the previous `|||WEMM_AUDIO|||` URL-encoding hack and the
+        # in-memory ZIP combine in the connector:
+        #   1. Forward WeMM video kwargs (fps/nframes/resized_*/...) to
+        #      `parse_wemm_video` when WEMM_FETCH_INPUT is active.
+        #   2. If the same part also carries an `audio_url` field, pass
+        #      it as a kwarg to parse_wemm_video. The connector then
+        #      fetches video+audio concurrently and stashes audio bytes
+        #      in the video metadata. Audio rides the "video" modality
+        #      so the training-time token layout (audio_pad interleaved
+        #      inside the <|vision_start|>...<|vision_end|> block) is
+        #      preserved end-to-end. No in-memory ZIP re-pack happens.
+        #   3. Preserve v011 semantics: `use_audio: true` inside video_url
+        #      means "decode audio from the same mp4". (Distinct from the
+        #      0.18.0 native `mm_processor_kwargs.use_audio_in_video`,
+        #      which is a server-wide switch handled in `parse_video`.)
         str_content = cast(str, content)
-        mm_parser.parse_video(str_content, uuid)
+        vp = part.get("video_url") if isinstance(part, dict) else None
+        wemm_vid_kwargs = _wemm_collect_kwargs(vp, _WEMM_VIDEO_PARAM_KEYS)
+
+        # Same-part `audio_url` ⇒ paired video+audio, ride video modality.
+        paired_audio_url = None
+        if isinstance(part, dict):
+            paired_audio_url = _wemm_extract_url(part.get("audio_url"))
+        if not paired_audio_url and isinstance(vp, dict):
+            paired_audio_url = _wemm_extract_url(vp.get("audio"))
+
+        # v011 compatibility: `use_audio: true` means extract audio from the
+        # same mp4. When WEMM fetch is active, pass this as audio_url to
+        # parse_wemm_video (which bundles video+audio into one item).
+        # Do NOT parse_audio separately, as that creates a mismatched item.
+        use_audio_from_video = (
+            not paired_audio_url and isinstance(vp, dict) and vp.get("use_audio")
+        )
+
+        if _wemm_fetch_input_enabled(mm_parser) and hasattr(
+            mm_parser, "parse_wemm_video"
+        ):
+            effective_audio_url = paired_audio_url
+            if use_audio_from_video:
+                effective_audio_url = str_content  # video URL is audio source
+            mm_parser.parse_wemm_video(
+                str_content,
+                uuid,
+                audio_url=effective_audio_url,
+                **wemm_vid_kwargs,
+            )
+        else:
+            mm_parser.parse_video(str_content, uuid)
+
         modality = "video"
     elif part_type == "tool_reference":
         # Tool references are not multimodal data — they reference deferred
@@ -1984,6 +2295,15 @@ def _parse_chat_message_content_part(
             # emit the single sentinel token as text so the template renders
             # it inline. The renderer later expands it to N tokens post-tokenize.
             return {"type": "text", "text": PROMPT_EMBEDS_PLACEHOLDER_TOKEN}
+        if modality == "audio" and _wemm_fetch_input_enabled(mm_parser):
+            # WeMM's checkpoint template accepts text/image/video content.
+            # vLLM 0.31 now detects that structured template automatically;
+            # keep native audio data in the tracker and render its existing
+            # model placeholder as text at the original content position.
+            placeholders = mm_parser.mm_placeholder_storage()[
+                MODALITY_PLACEHOLDERS_MAP["audio"]
+            ]
+            return {"type": "text", "text": placeholders[-1]}
         result = {"type": modality}
         result.update(_collect_extra_fields(cast(dict[str, Any], part)))
         return result
@@ -2155,6 +2475,16 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                     function["arguments"] = {}
 
 
+def _wemm_interleave_mm_strings(model_config):
+    """Keep WeMM media/history in message order, including mixed modalities."""
+    from vllm.multimodal.media.wemm import is_wemm_model
+
+    config = model_config.multimodal_config
+    return config is not None and (
+        config.interleave_mm_strings or is_wemm_model(model_config)
+    )
+
+
 def parse_chat_messages(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
@@ -2179,8 +2509,7 @@ def parse_chat_messages(
             content_format,
             interleave_strings=(
                 content_format == "string"
-                and model_config.multimodal_config is not None
-                and model_config.multimodal_config.interleave_mm_strings
+                and _wemm_interleave_mm_strings(model_config)
             ),
             mm_processor_kwargs=mm_processor_kwargs,
         )
@@ -2218,8 +2547,7 @@ async def parse_chat_messages_async(
             content_format,
             interleave_strings=(
                 content_format == "string"
-                and model_config.multimodal_config is not None
-                and model_config.multimodal_config.interleave_mm_strings
+                and _wemm_interleave_mm_strings(model_config)
             ),
             mm_processor_kwargs=mm_processor_kwargs,
         )
@@ -2259,3 +2587,73 @@ def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
     else:
         # by default return random
         return f"chatcmpl-tool-{random_uuid()}"
+
+
+# ============================================================================
+# WeMM integration: built-in handler for the new `video_audio_url` part type.
+# ----------------------------------------------------------------------------
+# Example payload:
+#   {
+#     "type": "video_audio_url",
+#     "video_url": {"url": "file://.../frames.zip", "fps": 2, "max_pixels": ...},
+#     "audio_url": {"url": "file://.../audio.wav"},
+#   }
+#
+# Behaviour: video and audio are loaded concurrently by a single connector
+# call (`fetch_wemm_video_with_audio_url_async`). The video frames go to
+# `mm_data["video"]` as usual and the audio bytes are stashed inside the
+# video metadata (`metadata["audio_bytes"]`). The model processor
+# (`wemm_omni.py`) detects bundled audio and interleaves `<|audio_pad|>`
+# tokens inside the `<|vision_start|>...<|vision_end|>` block, exactly
+# matching the training-time token layout.
+#
+# This is functionally equivalent to passing
+#   {"type": "video_url", "video_url": {...}, "audio_url": {...}}
+# but with explicit, self-documenting semantics.
+# ============================================================================
+
+
+@register_wemm_part("video_audio_url")
+def _wemm_handle_video_audio_url(part, mm_parser, uuid):
+    if not isinstance(part, dict):
+        return None
+
+    vp = part.get("video_url")
+    ap = part.get("audio_url")
+    if ap is None and isinstance(vp, dict):
+        ap = vp.get("audio")
+    video_url = _wemm_extract_url(vp)
+    audio_url = _wemm_extract_url(ap)
+
+    if not video_url and not audio_url:
+        logger.warning(
+            "Skipping 'video_audio_url' part with no video_url and no audio_url: %s",
+            part,
+        )
+        return None
+
+    if video_url:
+        wemm_vid_kwargs = _wemm_collect_kwargs(vp, _WEMM_VIDEO_PARAM_KEYS)
+        if _wemm_fetch_input_enabled(mm_parser) and hasattr(
+            mm_parser, "parse_wemm_video"
+        ):
+            # Paired fetch: audio rides the "video" modality via metadata.
+            mm_parser.parse_wemm_video(
+                video_url, uuid, audio_url=audio_url, **wemm_vid_kwargs
+            )
+            # `audio_url` already consumed inside parse_wemm_video.
+            audio_url = None
+        else:
+            mm_parser.parse_video(video_url, uuid)
+
+    if audio_url:
+        # Either standalone (no video_url) or non-WEMM mode where parse_wemm_video
+        # is unavailable. In both cases audio becomes its own modality item.
+        mm_parser.parse_audio(audio_url, uuid)
+
+    return "video" if video_url else "audio"
+
+
+# ============================================================================
+# End of WeMM integration
+# ============================================================================
